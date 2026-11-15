@@ -1,0 +1,10 @@
+---
+features:
+  - Add the ``tenacity.stats`` module with a ``tracked`` decorator that
+    exposes ``calls``, ``attempts`` and ``failures`` counters on a retried
+    function, so retry activity can be measured instead of counted in logs.
+upgrade:
+  - When retrying is exhausted and the last attempt raised, the ``RetryError``
+    that is raised is now also an instance of that exception's type. Catching
+    ``RetryError`` keeps working unchanged, and ``except ValueError`` now also
+    works without setting ``reraise=True``.

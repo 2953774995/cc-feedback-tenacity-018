@@ -196,6 +196,65 @@ def _is_no_wait(wait: object) -> bool:
     return wait is None or wait == 0
 
 
+_retry_error_types: dict[type[BaseException], type["RetryError"]] = {}
+_retry_error_types_lock = threading.Lock()
+
+
+def _make_retry_error(
+    error_cls: type["RetryError"], last_attempt: "Future"
+) -> "RetryError":
+    """Build the error raised when retrying is exhausted.
+
+    The returned object is a ``RetryError`` as always, but when the last
+    attempt failed it is also an instance of that exception's type, so callers
+    can catch either ``RetryError`` or the underlying error (e.g.
+    ``except ValueError``) without having to opt into ``reraise=True``.
+    """
+    if error_cls is not RetryError or not last_attempt.failed:
+        return error_cls(last_attempt)
+    exc_type = type(last_attempt.exception())
+    if not issubclass(exc_type, Exception):
+        # Never make RetryError catchable as KeyboardInterrupt, SystemExit,
+        # ... -- only regular exceptions opt in.
+        return error_cls(last_attempt)
+    blended = _retry_error_types.get(exc_type)
+    if blended is None:
+        with _retry_error_types_lock:
+            blended = _retry_error_types.get(exc_type)
+            if blended is None:
+                try:
+                    blended = type(
+                        "RetryError",
+                        (error_cls, exc_type),
+                        {
+                            "__module__": error_cls.__module__,
+                            "__qualname__": error_cls.__qualname__,
+                            # RetryError.__init__ ends with zero-argument
+                            # super(), which in this MRO would reach the
+                            # mixed-in exception's own constructor
+                            # (UnicodeDecodeError takes five arguments, some
+                            # custom errors require several). Go straight to
+                            # BaseException instead.
+                            "__init__": _init_blended_retry_error,
+                        },
+                    )
+                except TypeError:
+                    # Incompatible instance layouts cannot be mixed in; keep
+                    # the plain RetryError rather than failing the retried
+                    # call.
+                    blended = error_cls
+                _retry_error_types[exc_type] = blended
+    try:
+        return blended(last_attempt)
+    except TypeError:
+        return error_cls(last_attempt)
+
+
+def _init_blended_retry_error(self: "RetryError", last_attempt: "Future") -> None:
+    self.last_attempt = last_attempt
+    BaseException.__init__(self, last_attempt)
+
+
 class RetryError(Exception):
     """Encapsulates the last attempt instance right before giving up."""
 
@@ -477,10 +536,9 @@ class BaseRetrying(ABC):
 
             def exc_check(rs: "RetryCallState") -> None:
                 fut = t.cast("Future", rs.outcome)
-                retry_exc = self.retry_error_cls(fut)
                 if self.reraise:
-                    retry_exc.reraise()
-                raise retry_exc from fut.exception()
+                    self.retry_error_cls(fut).reraise()
+                raise _make_retry_error(self.retry_error_cls, fut) from fut.exception()
 
             self._add_action_func(exc_check)
             return
